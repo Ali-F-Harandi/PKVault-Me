@@ -93,6 +93,62 @@ jobs:
           cd ..
         continue-on-error: false
 
+      - name: Generate Frontend SDK
+        run: |
+          Write-Host "Generating frontend SDK from backend..."
+          Write-Host "Starting backend server..."
+          $job = Start-Job -ScriptBlock {
+            cd PKVault.Backend
+            dotnet run --no-launch-profile --urls "http://localhost:5000"
+          }
+
+          Write-Host "Waiting for backend to start..."
+          Start-Sleep -Seconds 30
+
+          Write-Host "Testing backend connection..."
+          $maxAttempts = 30
+          $attempt = 0
+          do {
+            $attempt++
+            try {
+              $response = Invoke-WebRequest -Uri "http://localhost:5000/swagger/v1/swagger.json" -UseBasicParsing -TimeoutSec 5
+              if ($response.StatusCode -eq 200) {
+                Write-Host "Backend is ready!"
+                break
+              }
+            } catch {
+              Write-Host "Attempt $attempt of $maxAttempts failed, retrying..."
+              Start-Sleep -Seconds 2
+            }
+          } while ($attempt -lt $maxAttempts)
+
+          if ($attempt -ge $maxAttempts) {
+            Write-Error "Backend failed to start within expected time"
+            Stop-Job $job
+            Remove-Job $job
+            exit 1
+          }
+
+          Write-Host "Generating SDK with Orval..."
+          cd frontend
+          $env:NODE_TLS_REJECT_UNAUTHORIZED = "0"
+          $env:VITE_SERVER_URL = "http://localhost:5000"
+          npm run gen:sdk
+
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "SDK generation failed"
+            Stop-Job $job
+            Remove-Job $job
+            exit 1
+          }
+
+          Write-Host "SDK generated successfully!"
+          cd ..
+
+          Stop-Job $job
+          Remove-Job $job
+        continue-on-error: false
+
       - name: Build Frontend
         run: |
           Write-Host "Building frontend..."
