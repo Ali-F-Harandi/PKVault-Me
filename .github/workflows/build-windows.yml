@@ -90,76 +90,73 @@ jobs:
           npm install
           cd ..
 
-      - name: Build Backend
-        run: |
-          Write-Host "Building backend..."
-          dotnet build PKVault.Backend/PKVault.Backend.csproj -c Release
-
       - name: Generate Frontend SDK
         run: |
           Write-Host "Generating frontend SDK from backend..."
           Write-Host "Starting backend server..."
 
-          # Build backend
-          dotnet build PKVault.Backend/PKVault.Backend.csproj -c Release
+          # Use Start-Job for better process management
+          $job = Start-Job -ScriptBlock {
+            $env:ASPNETCORE_ENVIRONMENT = "Production"
+            $env:ASPNETCORE_URLS = "http://localhost:5000"
 
-          # Start backend in background
-          cd PKVault.Backend
-          $env:ASPNETCORE_URLS = "http://localhost:5000"
-          Start-Process dotnet -ArgumentList "bin/Release/net9.0-windows/PKVault.Backend.dll","--urls","http://localhost:5000" -NoNewWindow -RedirectStandardOutput "backend.log" -RedirectStandardError "backend-error.log"
-          $backendProcess = Get-Process dotnet | Where-Object {$_.Path -like "*PKVault.Backend*"} | Select-Object -First 1
+            cd PKVault.Backend
+            dotnet run --no-launch-profile --urls "http://localhost:5000"
+          } -ArgumentList @()
 
-          Write-Host "Backend process ID: $($backendProcess.Id)"
+          Write-Host "Backend started with Job ID: $($job.Id)"
 
           # Wait for backend to be ready
           Write-Host "Waiting for backend to start..."
-          Start-Sleep -Seconds 25
+          Start-Sleep -Seconds 30
 
           # Check if backend is ready
           $ready = $false
-          for ($i = 0; $i -lt 40; $i++) {
+          for ($i = 0; $i -lt 50; $i++) {
             try {
               $response = Invoke-WebRequest -Uri "http://localhost:5000/swagger/v1/swagger.json" -UseBasicParsing -TimeoutSec 3 -ErrorAction Stop
               if ($response.StatusCode -eq 200) {
                 $ready = $true
                 Write-Host "Backend is ready after $($i+1) attempts!"
+                Write-Host "Swagger endpoint responding correctly"
                 break
               }
             } catch {
-              Write-Host "Attempt $($i+1)/40 - Waiting..."
+              Write-Host "Attempt $($i+1)/50 - Waiting..."
               Start-Sleep -Seconds 2
             }
           }
 
           if (-not $ready) {
-            Write-Error "Backend failed to start within 80 seconds"
-            if (Test-Path backend-error.log) {
-              Write-Host "Backend error log:"
-              Get-Content backend-error.log | Select-Object -Last 20
-            }
-            Stop-Process -Id $backendProcess.Id -Force -ErrorAction SilentlyContinue
+            Write-Error "Backend failed to start within 100 seconds"
+            Stop-Job $job -Force
+            Remove-Job $job -Force
             exit 1
           }
 
           # Generate SDK
           Write-Host "Generating SDK with Orval..."
-          cd ../frontend
+          cd frontend
           $env:NODE_TLS_REJECT_UNAUTHORIZED = "0"
           $env:VITE_SERVER_URL = "http://localhost:5000"
           npm run gen:sdk
 
           if ($LASTEXITCODE -ne 0) {
             Write-Error "SDK generation failed with exit code $LASTEXITCODE"
-            Stop-Process -Id $backendProcess.Id -Force -ErrorAction SilentlyContinue
+            Stop-Job $job -Force
+            Remove-Job $job -Force
             exit 1
           }
 
           Write-Host "SDK generated successfully!"
+          Write-Host "Generated SDK files:"
+          Get-ChildItem -Path src/data/sdk -Recurse -File | Select-Object -First 10
 
           # Stop backend
-          Write-Host "Stopping backend..."
-          Stop-Process -Id $backendProcess.Id -Force -ErrorAction SilentlyContinue
-          Start-Sleep -Seconds 2
+          Write-Host "Stopping backend job..."
+          Stop-Job $job -Force
+          Remove-Job $job -Force
+          Start-Sleep -Seconds 3
 
       - name: Build Frontend
         run: |
@@ -180,6 +177,8 @@ jobs:
             exit 1
           }
 
+          Write-Host "Frontend build output files:"
+          Get-ChildItem -Path dist | Select-Object Name, Length
           Write-Host "Frontend build completed successfully"
 
       - name: Prepare WinForm wwwroot
@@ -209,6 +208,8 @@ jobs:
           }
 
           Write-Host "WinForm wwwroot prepared successfully"
+          Write-Host "wwwroot contents:"
+          Get-ChildItem -Path "PKVault.WinForm/wwwroot" | Select-Object Name, @{Name="Size(MB)"; Expression={[math]::Round($_.Length/1MB,2)}}
 
       - name: Build WinForm for Windows x64
         run: |
@@ -246,6 +247,8 @@ jobs:
 
           Write-Host "WinForm build completed successfully"
           Write-Host "Output: $exePath"
+          $exeInfo = Get-Item $exePath
+          Write-Host "PKVault.exe size: $([math]::Round($exeInfo.Length/1MB,2)) MB"
 
       - name: Create Release Directory
         run: |
@@ -272,6 +275,8 @@ jobs:
           }
 
           Write-Host "Build artifacts copied successfully"
+          Write-Host "Release contents:"
+          Get-ChildItem -Path $destPath | Select-Object Name, @{Name="Size(MB)"; Expression={[math]::Round($_.Length/1MB,2)}}
 
       - name: Create Build Info
         run: |
