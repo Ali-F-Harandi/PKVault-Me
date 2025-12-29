@@ -1,0 +1,190 @@
+name: Build PKVault Windows x64
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Build version (optional)'
+        required: false
+        default: ''
+
+  push:
+    branches: [ main, master ]
+    paths:
+      - 'PKVault.Backend/**'
+      - 'frontend/**'
+      - 'PKVault.WinForm/**'
+      - '.github/workflows/build-windows.yml'
+
+  pull_request:
+    branches: [ main, master ]
+    paths:
+      - 'PKVault.Backend/**'
+      - 'frontend/**'
+      - 'PKVault.WinForm/**'
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    env:
+      DOTNET_VERSION: '9.0.x'
+      NODE_VERSION: '20'
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Cache npm dependencies
+        uses: actions/cache@v4
+        with:
+          path: frontend/node_modules
+          key: ${{ runner.os }}-node-${{ hashFiles('frontend/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-
+
+      - name: Cache PokeApi data
+        uses: actions/cache@v4
+        with:
+          path: PKVault.Backend/pokeapi/data
+          key: pokeapi-data-v1-${{ hashFiles('PKVault.Backend/pokeapi/**/*.cs') }}
+          restore-keys: |
+            pokeapi-data-v1-
+
+      - name: Verify .NET SDK
+        run: |
+          dotnet --version
+          dotnet --info
+
+      - name: Verify Node.js and npm
+        run: |
+          node --version
+          npm --version
+
+      - name: Restore NuGet Packages
+        run: dotnet restore pkvault.sln
+        continue-on-error: false
+
+      - name: Generate PokeApi Data
+        run: |
+          Write-Host "Generating PokeApi data..."
+          cd PKVault.Backend
+          dotnet run -p:Mode=gen-pokeapi
+          cd ..
+        continue-on-error: false
+
+      - name: Install Frontend Dependencies
+        run: |
+          Write-Host "Installing frontend dependencies..."
+          cd frontend
+          npm install
+          cd ..
+        continue-on-error: false
+
+      - name: Build Frontend
+        run: |
+          Write-Host "Building frontend..."
+          cd frontend
+          $env:VITE_SERVER_URL = "http://localhost:5000"
+          $env:VITE_DESKTOP = "1"
+          npm run build
+          cd ..
+        continue-on-error: false
+
+      - name: Prepare WinForm wwwroot
+        run: |
+          Write-Host "Preparing WinForm wwwroot folder..."
+          Remove-Item -Path "PKVault.WinForm/wwwroot" -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path "PKVault.WinForm/wwwroot" -Force
+          Copy-Item -Path "frontend/dist/*" -Destination "PKVault.WinForm/wwwroot" -Recurse -Force
+        continue-on-error: false
+
+      - name: Build WinForm for Windows x64
+        run: |
+          Write-Host "Building PKVault for Windows x64..."
+          dotnet publish PKVault.WinForm/PKVault.WinForm.csproj `
+            -c Release `
+            -r win-x64 `
+            --self-contained true `
+            -p:PublishSingleFile=true `
+            -p:PublishTrimmed=true `
+            -p:PackageVersion="${{ github.event.inputs.version || '1.3.5' }}"
+        continue-on-error: false
+
+      - name: Create Release Directory
+        run: |
+          Write-Host "Creating release directory..."
+          New-Item -ItemType Directory -Path "release" -Force
+          New-Item -ItemType Directory -Path "release/PKVault-Windows-x64" -Force
+
+      - name: Copy Build Artifacts
+        run: |
+          Write-Host "Copying build artifacts..."
+          Copy-Item -Path "PKVault.WinForm/bin/Release/win-x64/publish/*" -Destination "release/PKVault-Windows-x64" -Recurse -Force
+
+      - name: Create Build Info
+        run: |
+          $buildInfo = @"
+          PKVault Windows x64 Build
+          =========================
+          Build Date: $(Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+          Platform: Windows x64
+          Configuration: Release
+          Target Framework: net9.0-windows
+          Version: ${{ github.event.inputs.version || '1.3.5' }}
+
+          Build completed successfully!
+
+          Built by GitHub Actions
+          Repository: ${{ github.repository }}
+          Commit: ${{ github.sha }}
+          Workflow: ${{ github.workflow }}
+          Run ID: ${{ github.run_id }}
+          "@
+
+          $buildInfo | Out-File -FilePath "release/PKVault-Windows-x64/BUILD_INFO.txt" -Encoding UTF8
+
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: PKVault-Windows-x64-${{ github.run_number }}
+          path: release/PKVault-Windows-x64/*
+          retention-days: 90
+
+      - name: Create Release Archive
+        run: |
+          Write-Host "Creating release archive..."
+          Compress-Archive -Path "release/PKVault-Windows-x64/*" -DestinationPath "release/PKVault-Windows-x64.zip" -Force
+
+      - name: Upload ZIP Archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: PKVault-Windows-x64-zip-${{ github.run_number }}
+          path: release/PKVault-Windows-x64.zip
+          retention-days: 90
+
+      - name: Build Summary
+        run: |
+          Write-Host "::notice::Build completed successfully!"
+          Write-Host "====================================="
+          Write-Host "PKVault Windows x64 Build Summary"
+          Write-Host "====================================="
+          Write-Host "Platform: Windows x64"
+          Write-Host "Runtime: win-x64"
+          Write-Host "Configuration: Release"
+          Write-Host "Version: ${{ github.event.inputs.version || '1.3.5' }}"
+          Write-Host "Artifact: PKVault-Windows-x64-${{ github.run_number }}"
+          Write-Host "====================================="
+          Write-Host "Download your build from the Actions tab!"
