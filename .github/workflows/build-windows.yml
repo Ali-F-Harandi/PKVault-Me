@@ -1,331 +1,103 @@
-name: Build PKVault Windows x64
-
+# Build PKVault WinForm EXE (frontend + .NET publish)
 on:
-  workflow_dispatch:
-    inputs:
-      version:
-        description: 'Build version (optional)'
-        required: false
-        default: ''
-
   push:
-    branches: [ main, master ]
-    paths:
-      - 'PKVault.Backend/**'
-      - 'frontend/**'
-      - 'PKVault.WinForm/**'
-      - '.github/workflows/build-windows.yml'
-
-  pull_request:
-    branches: [ main, master ]
-    paths:
-      - 'PKVault.Backend/**'
-      - 'frontend/**'
-      - 'PKVault.WinForm/**'
+    branches: [ "main" ]
+    tags:
+      - 'v*'        # release tags (optional)
+  workflow_dispatch:
 
 jobs:
-  build:
+  build-windows:
+    name: Build Windows EXE (win-x64)
     runs-on: windows-latest
-
     env:
-      DOTNET_VERSION: '9.0.x'
-      NODE_VERSION: '20'
-
+      VITE_SERVER_URL: "http://localhost:5000"
+      VITE_DESKTOP: "1"
     steps:
-      - name: Checkout Repository
+      - name: Checkout repository (with submodules)
         uses: actions/checkout@v4
         with:
           submodules: recursive
-
-      - name: Setup .NET SDK
-        uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: ${{ env.DOTNET_VERSION }}
+          fetch-depth: 0
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: ${{ env.NODE_VERSION }}
+          node-version: "18"
 
-      - name: Cache npm dependencies
-        uses: actions/cache@v4
-        with:
-          path: frontend/node_modules
-          key: ${{ runner.os }}-node-${{ hashFiles('frontend/package-lock.json') }}
-          restore-keys: |
-            ${{ runner.os }}-node-
-
-      - name: Cache PokeApi data
-        uses: actions/cache@v4
-        with:
-          path: PKVault.Backend/pokeapi/data
-          key: pokeapi-data-v1-${{ hashFiles('PKVault.Backend/pokeapi/**/*.cs') }}
-          restore-keys: |
-            pokeapi-data-v1-
-
-      - name: Verify .NET SDK
+      - name: Install frontend deps & build
+        working-directory: frontend
+        shell: pwsh
         run: |
-          dotnet --version
-          dotnet --info
-
-      - name: Verify Node.js and npm
-        run: |
-          node --version
-          npm --version
-
-      - name: Restore NuGet Packages
-        run: dotnet restore pkvault.sln
-
-      - name: Generate PokeApi Data
-        run: |
-          Write-Host "Generating PokeApi data..."
-          cd PKVault.Backend
-          dotnet run -p:Mode=gen-pokeapi
-          cd ..
-
-      - name: Install Frontend Dependencies
-        run: |
-          Write-Host "Installing frontend dependencies..."
-          cd frontend
-          npm install
-          cd ..
-
-      - name: Generate Frontend SDK
-        run: |
-          Write-Host "Generating frontend SDK from backend..."
-          Write-Host "Starting backend server..."
-
-          # Use Start-Job for better process management
-          $job = Start-Job -ScriptBlock {
-            $env:ASPNETCORE_ENVIRONMENT = "Production"
-            $env:ASPNETCORE_URLS = "http://localhost:5000"
-
-            cd PKVault.Backend
-            dotnet run --no-launch-profile --urls "http://localhost:5000"
-          }
-
-          Write-Host "Backend started with Job ID: $($job.Id)"
-
-          # Wait for backend to be ready
-          Write-Host "Waiting for backend to start..."
-          Start-Sleep -Seconds 30
-
-          # Check if backend is ready
-          $ready = $false
-          for ($i = 0; $i -lt 50; $i++) {
-            try {
-              $response = Invoke-WebRequest -Uri "http://localhost:5000/swagger/v1/swagger.json" -UseBasicParsing -TimeoutSec 3 -ErrorAction Stop
-              if ($response.StatusCode -eq 200) {
-                $ready = $true
-                Write-Host "Backend is ready after $($i+1) attempts!"
-                Write-Host "Swagger endpoint responding correctly"
-                break
-              }
-            } catch {
-              Write-Host "Attempt $($i+1)/50 - Waiting..."
-              Start-Sleep -Seconds 2
-            }
-          }
-
-          if (-not $ready) {
-            Write-Error "Backend failed to start within 100 seconds"
-            Remove-Job $job -Force
-            exit 1
-          }
-
-          # Generate SDK
-          Write-Host "Generating SDK with Orval..."
-          cd frontend
-          $env:NODE_TLS_REJECT_UNAUTHORIZED = "0"
-          $env:VITE_SERVER_URL = "http://localhost:5000"
-          npm run gen:sdk
-
-          if ($LASTEXITCODE -ne 0) {
-            Write-Error "SDK generation failed with exit code $LASTEXITCODE"
-            Remove-Job $job -Force
-            exit 1
-          }
-
-          Write-Host "SDK generated successfully!"
-          Write-Host "Generated SDK files:"
-          Get-ChildItem -Path src/data/sdk -Recurse -File | Select-Object -First 10
-
-          # Stop backend - use Remove-Job instead of Stop-Job
-          Write-Host "Removing backend job..."
-          Remove-Job -Id $job.Id -Force
-          Write-Host "Backend job removed successfully"
-
-      - name: Build Frontend
-        run: |
-          Write-Host "Building frontend..."
-          cd frontend
-          $env:VITE_SERVER_URL = "http://localhost:5000"
-          $env:VITE_DESKTOP = "1"
+          npm ci
+          # set env for Vite build (already provided in job env, but set explicitly for PowerShell)
+          $env:VITE_SERVER_URL = '${{ env.VITE_SERVER_URL }}'
+          $env:VITE_DESKTOP = '${{ env.VITE_DESKTOP }}'
           npm run build
 
-          if ($LASTEXITCODE -ne 0) {
-            Write-Error "Frontend build failed with exit code $LASTEXITCODE"
-            exit 1
-          }
-
-          Write-Host "Checking frontend build output..."
-          if (-not (Test-Path "dist")) {
-            Write-Error "Frontend dist folder not found!"
-            exit 1
-          }
-
-          Write-Host "Frontend build output files:"
-          Get-ChildItem -Path dist | Select-Object Name, Length
-          Write-Host "Frontend build completed successfully"
-
-      - name: Prepare WinForm wwwroot
+      - name: Copy frontend build into WinForm wwwroot
+        shell: pwsh
         run: |
-          Write-Host "Preparing WinForm wwwroot folder..."
+          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue PKVault.WinForm\wwwroot
+          New-Item -ItemType Directory -Force PKVault.WinForm\wwwroot | Out-Null
+          Copy-Item -Path frontend\dist\* -Destination PKVault.WinForm\wwwroot -Recurse -Force
 
-          # Check if frontend dist exists
-          if (-not (Test-Path "frontend/dist")) {
-            Write-Error "Frontend dist folder not found. Frontend build may have failed."
-            exit 1
-          }
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v3
+        with:
+          dotnet-version: '9.0.x'  # match TargetFramework net9.0-windows
 
-          # Remove old wwwroot
-          Remove-Item -Path "PKVault.WinForm/wwwroot" -Recurse -Force -ErrorAction SilentlyContinue
+      - name: Cache NuGet packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: nuget-packages-${{ runner.os }}-$(Get-FileHash -Path "pkvault.sln" -Algorithm SHA256 | ForEach-Object { $_.Hash })
+        shell: pwsh
 
-          # Create new wwwroot
-          New-Item -ItemType Directory -Path "PKVault.WinForm/wwwroot" -Force
+      - name: Restore solution
+        run: dotnet restore ./pkvault.sln
 
-          # Copy frontend build to wwwroot
-          Write-Host "Copying frontend dist to wwwroot..."
-          Copy-Item -Path "frontend/dist/*" -Destination "PKVault.WinForm/wwwroot" -Recurse -Force
-
-          # Verify copy
-          if (-not (Test-Path "PKVault.WinForm/wwwroot/index.html")) {
-            Write-Error "wwwroot/index.html not found after copy!"
-            exit 1
-          }
-
-          Write-Host "WinForm wwwroot prepared successfully"
-          Write-Host "wwwroot contents:"
-          Get-ChildItem -Path "PKVault.WinForm/wwwroot" | Select-Object Name, @{Name="Size(MB)"; Expression={[math]::Round($_.Length/1MB,2)}}
-
-      - name: Build WinForm for Windows x64
+      - name: Publish WinForm single-file EXE
         run: |
-          Write-Host "Building PKVault for Windows x64..."
-          Write-Host "Configuration: Release"
-          Write-Host "Runtime: win-x64"
+          dotnet publish PKVault.WinForm/PKVault.WinForm.csproj \
+            -c Release \
+            -r win-x64 \
+            --self-contained true \
+            -p:PublishSingleFile=true \
+            -p:PublishTrimmed=true \
+            -o ./artifacts
+      - name: List artifacts
+        run: dir artifacts
+        shell: pwsh
 
-          dotnet publish PKVault.WinForm/PKVault.WinForm.csproj `
-            -c Release `
-            -r win-x64 `
-            --self-contained true `
-            -p:PublishSingleFile=true `
-            -p:PublishTrimmed=true `
-            -p:PackageVersion="${{ github.event.inputs.version || '1.3.5' }}"
-
-          if ($LASTEXITCODE -ne 0) {
-            Write-Error "WinForm build failed with exit code $LASTEXITCODE"
-            exit 1
-          }
-
-          # Check if output exists
-          $publishPath = "PKVault.WinForm/bin/Release/win-x64/publish"
-          if (-not (Test-Path $publishPath)) {
-            Write-Error "Publish path not found: $publishPath"
-            Write-Host "Looking for alternative paths..."
-            Get-ChildItem -Path "PKVault.WinForm/bin" -Recurse -Filter "*.exe" | Select-Object FullName
-            exit 1
-          }
-
-          $exePath = Join-Path $publishPath "PKVault.exe"
-          if (-not (Test-Path $exePath)) {
-            Write-Error "PKVault.exe not found at $exePath"
-            exit 1
-          }
-
-          Write-Host "WinForm build completed successfully"
-          Write-Host "Output: $exePath"
-          $exeInfo = Get-Item $exePath
-          Write-Host "PKVault.exe size: $([math]::Round($exeInfo.Length/1MB,2)) MB"
-
-      - name: Create Release Directory
-        run: |
-          Write-Host "Creating release directory..."
-          New-Item -ItemType Directory -Path "release" -Force
-          New-Item -ItemType Directory -Path "release/PKVault-Windows-x64" -Force
-
-      - name: Copy Build Artifacts
-        run: |
-          Write-Host "Copying build artifacts..."
-          $sourcePath = "PKVault.WinForm/bin/Release/win-x64/publish"
-          $destPath = "release/PKVault-Windows-x64"
-
-          if (-not (Test-Path $sourcePath)) {
-            Write-Error "Source path not found: $sourcePath"
-            exit 1
-          }
-
-          Copy-Item -Path "$sourcePath/*" -Destination $destPath -Recurse -Force
-
-          if (-not (Test-Path "$destPath/PKVault.exe")) {
-            Write-Error "PKVault.exe not found in release directory!"
-            exit 1
-          }
-
-          Write-Host "Build artifacts copied successfully"
-          Write-Host "Release contents:"
-          Get-ChildItem -Path $destPath | Select-Object Name, @{Name="Size(MB)"; Expression={[math]::Round($_.Length/1MB,2)}}
-
-      - name: Create Build Info
-        run: |
-          $buildInfo = @"
-          PKVault Windows x64 Build
-          =========================
-          Build Date: $(Get-Date -Format "yyyy-MM-dd HH:mm:ss")
-          Platform: Windows x64
-          Configuration: Release
-          Target Framework: net9.0-windows
-          Version: ${{ github.event.inputs.version || '1.3.5' }}
-
-          Build completed successfully!
-
-          Built by GitHub Actions
-          Repository: ${{ github.repository }}
-          Commit: ${{ github.sha }}
-          Workflow: ${{ github.workflow }}
-          Run ID: ${{ github.run_id }}
-          "@
-
-          $buildInfo | Out-File -FilePath "release/PKVault-Windows-x64/BUILD_INFO.txt" -Encoding UTF8
-
-      - name: Upload Build Artifacts
+      - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: PKVault-Windows-x64-${{ github.run_number }}
-          path: release/PKVault-Windows-x64/*
-          retention-days: 90
+          name: pkvault-windows-exe
+          path: artifacts/*.exe
 
-      - name: Create Release Archive
+      # Optional: create GitHub Release and upload EXE when this run is for a tag push
+      - name: Find built EXE (for release upload)
+        if: startsWith(github.ref, 'refs/tags/')
+        id: find_exe
+        shell: pwsh
         run: |
-          Write-Host "Creating release archive..."
-          Compress-Archive -Path "release/PKVault-Windows-x64/*" -DestinationPath "release/PKVault-Windows-x64.zip" -Force
+          $exe = (Get-ChildItem -Path artifacts -Filter *.exe -Recurse | Select-Object -First 1).FullName
+          if (-not $exe) { Write-Error "No EXE found in artifacts"; exit 1 }
+          echo "exe=$exe" >> $env:GITHUB_OUTPUT
 
-      - name: Upload ZIP Archive
-        uses: actions/upload-artifact@v4
+      - name: Create GitHub release (on tag)
+        if: startsWith(github.ref, 'refs/tags/')
+        id: create_release
+        uses: ncipollo/release-action@v1
         with:
-          name: PKVault-Windows-x64-zip-${{ github.run_number }}
-          path: release/PKVault-Windows-x64.zip
-          retention-days: 90
+          tag: ${{ github.ref_name }}
 
-      - name: Build Summary
-        run: |
-          Write-Host "::notice::Build completed successfully!"
-          Write-Host "====================================="
-          Write-Host "PKVault Windows x64 Build Summary"
-          Write-Host "====================================="
-          Write-Host "Platform: Windows x64"
-          Write-Host "Runtime: win-x64"
-          Write-Host "Configuration: Release"
-          Write-Host "Version: ${{ github.event.inputs.version || '1.3.5' }}"
-          Write-Host "Artifact: PKVault-Windows-x64-${{ github.run_number }}"
-          Write-Host "====================================="
-          Write-Host "Download your build from the Actions tab!"
+      - name: Upload release asset (on tag)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: actions/upload-release-asset@v1
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ${{ steps.find_exe.outputs.exe }}
+          asset_name: PKVault.exe
+          asset_content_type: application/octet-stream
