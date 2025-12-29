@@ -1,5 +1,4 @@
-name: Build Windows Desktop App
-
+# Build PKVault WinForm EXE (frontend + .NET publish) — POC with OpenAPI fallback codegen + stubs
 on:
   push:
     branches: [ "main" ]
@@ -8,66 +7,176 @@ on:
   workflow_dispatch:
 
 jobs:
-  build:
+  build-windows:
+    name: Build Windows Desktop App (POC)
     runs-on: windows-latest
+    env:
+      VITE_SERVER_URL: "http://localhost:5000"
+      VITE_DESKTOP: "1"
 
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-      with:
-        submodules: recursive
-        fetch-depth: 0
+      - name: Checkout repository (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
 
-    # 1. Setup Node.js for the frontend build
-    - name: Setup Node.js
-      uses: actions/setup-node@v4
-      with:
-        node-version: '20'
+      - name: Setup .NET SDK (required to run backend)
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '9.0.x'
 
-    # 2. Install frontend dependencies explicitly
-    - name: Install Frontend Dependencies
-      run: |
-        cd frontend
-        npm install
-      shell: bash
+      - name: Start Backend for OpenAPI (background)
+        id: start_backend
+        shell: pwsh
+        run: |
+          Write-Host "Starting backend (dotnet run --project PKVault.Backend) in background..."
 
-    - name: Setup .NET
-      uses: actions/setup-dotnet@v4
-      with:
-        dotnet-version: 8.0.x 
+          # Start backend process in background and capture PID so we can stop it later
+          $p = Start-Process -FilePath "dotnet" -ArgumentList "run", "--project", "PKVault.Backend", "--urls", "http://localhost:5000" -NoNewWindow -PassThru
 
-    # 3. Now run the Make command (it will find 'vite' now)
-    - name: Prepare WinForm Assets
-      run: |
-        if (Get-Command "make" -ErrorAction SilentlyContinue) {
-            make prepare-winform
-        } else {
-            # Fallback if 'make' is missing on the runner
-            Write-Host "Make not found, running manual commands..."
-            cd frontend
-            $env:VITE_SERVER_URL="http://localhost:5000"
-            $env:VITE_DESKTOP="1"
-            npm run build
-            cd ..
-            if (Test-Path -Path "./PKVault.WinForm/wwwroot") { Remove-Item -Recurse -Force "./PKVault.WinForm/wwwroot" }
-            Copy-Item -Recurse "./frontend/dist" "./PKVault.WinForm/wwwroot"
-        }
-      shell: powershell
+          # expose PID to later steps
+          echo "backend_pid=$($p.Id)" >> $env:GITHUB_OUTPUT
+          Write-Host "Backend started with PID $($p.Id). Waiting for swagger endpoint..."
 
-    - name: Restore .NET dependencies
-      run: dotnet restore PKVault.WinForm/PKVault.WinForm.csproj
+          # wait for swagger json to be available
+          $ok = $false
+          for ($i = 0; $i -lt 60; $i++) {
+            try {
+              $r = Invoke-WebRequest -Uri "http://localhost:5000/swagger/v1/swagger.json" -UseBasicParsing -TimeoutSec 2
+              if ($r.StatusCode -eq 200) {
+                $ok = $true
+                break
+              }
+            } catch {}
+            Start-Sleep -Seconds 1
+          }
 
-    - name: Publish WinForm App
-      run: |
-        dotnet publish PKVault.WinForm/PKVault.WinForm.csproj `
-        -c Release `
-        -r win-x64 `
-        --self-contained false `
-        -o ./publish
+          if (-not $ok) {
+            Write-Error "Backend swagger endpoint not available after timeout. Check backend logs above for errors."
+            # print some process info for debugging
+            Get-Process -Id $p.Id | Format-List * | ForEach-Object { Write-Host $_ }
+            exit 1
+          }
 
-    - name: Upload Build Artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: PKVault-Windows-Build
-        path: ./publish
-        if-no-files-found: error
+          Write-Host "Swagger endpoint available."
+
+      - name: Setup Node.js 20 (for Vite)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        shell: pwsh
+        run: |
+          npm ci
+
+      - name: Generate TypeScript SDK from backend OpenAPI (openapi-typescript)
+        working-directory: frontend
+        shell: pwsh
+        run: |
+          # use npx to run openapi-typescript against the backend swagger endpoint
+          npx --yes openapi-typescript http://localhost:5000/swagger/v1/swagger.json --output src/data/sdk/openapi.gen.ts
+          Write-Host "Generated frontend/src/data/sdk/openapi.gen.ts"
+
+      - name: Create minimal stub files expected by the frontend (POC)
+        working-directory: frontend
+        shell: pwsh
+        run: |
+          # Some frontend imports expect separated generated files (settings.gen, backup.gen, ...).
+          # Create minimal stubs so the Vite build can proceed as a POC. Replace with your real generator if available.
+          $stubs = @(
+            "src/data/sdk/settings/settings.gen.ts",
+            "src/data/sdk/backup/backup.gen.ts"
+          )
+
+          foreach ($f in $stubs) {
+            $dir = Split-Path $f -Parent
+            if (-not (Test-Path $dir)) {
+              New-Item -ItemType Directory -Path $dir -Force | Out-Null
+            }
+            if (-not (Test-Path $f)) {
+              @"
+            // AUTO-GENERATED POC STUB — replace with real generated SDK content
+            // Path: $f
+            export const __POC_STUB = {};
+            export default __POC_STUB;
+"@ | Out-File -FilePath $f -Encoding utf8
+              Write-Host "Created stub $f"
+            } else {
+              Write-Host "Stub already exists: $f"
+            }
+          }
+
+      - name: Build frontend (Vite)
+        working-directory: frontend
+        shell: pwsh
+        run: |
+          npm run build
+
+      - name: Copy frontend build into WinForm wwwroot
+        shell: pwsh
+        run: |
+          $dest = "PKVault.WinForm\wwwroot"
+          if (Test-Path $dest) {
+            Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $dest
+          }
+          New-Item -ItemType Directory -Force $dest | Out-Null
+          Copy-Item -Path "frontend\dist\*" -Destination $dest -Recurse -Force
+          Write-Host "Copied frontend/dist to $dest"
+
+      - name: Setup .NET SDK for publish (ensure matching SDK)
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '9.0.x'
+
+      - name: Cache NuGet packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: nuget-packages-${{ runner.os }}-${{ hashFiles('**/pkvault.sln') }}
+          restore-keys: |
+            nuget-packages-${{ runner.os }}-
+
+      - name: Restore solution
+        shell: pwsh
+        run: dotnet restore ./pkvault.sln
+
+      - name: Publish WinForm single-file EXE (win-x64)
+        shell: pwsh
+        run: |
+          dotnet publish PKVault.WinForm/PKVault.WinForm.csproj `
+            -c Release `
+            -r win-x64 `
+            --self-contained true `
+            -p:PublishSingleFile=true `
+            -p:PublishTrimmed=true `
+            -o ./artifacts
+
+      - name: List artifacts
+        shell: pwsh
+        run: |
+          Get-ChildItem -Path ./artifacts -Recurse | ForEach-Object { Write-Host $_.FullName }
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pkvault-windows-exe
+          path: artifacts/*.exe
+
+      - name: Stop backend started for codegen
+        if: always()
+        shell: pwsh
+        run: |
+          if (${{ steps.start_backend.outputs.backend_pid }}) {
+            try {
+              Write-Host "Stopping backend PID ${{ steps.start_backend.outputs.backend_pid }}..."
+              Stop-Process -Id ${{ steps.start_backend.outputs.backend_pid }} -Force -ErrorAction SilentlyContinue
+              Write-Host "Stopped backend."
+            } catch {
+              Write-Host "Failed to stop backend process or it already exited."
+            }
+          } else {
+            Write-Host "No backend PID recorded; nothing to stop."
+          }
