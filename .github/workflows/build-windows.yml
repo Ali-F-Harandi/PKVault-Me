@@ -27,20 +27,18 @@ jobs:
 
       - name: Install frontend deps & build
         working-directory: frontend
-        shell: pwsh
         run: |
           npm ci
-          # set env for Vite build (already provided in job env, but set explicitly for PowerShell)
-          $env:VITE_SERVER_URL = '${{ env.VITE_SERVER_URL }}'
-          $env:VITE_DESKTOP = '${{ env.VITE_DESKTOP }}'
+          # set env for Vite build (already provided in job env)
           npm run build
+        shell: pwsh
 
       - name: Copy frontend build into WinForm wwwroot
-        shell: pwsh
         run: |
           Remove-Item -Recurse -Force -ErrorAction SilentlyContinue PKVault.WinForm\wwwroot
           New-Item -ItemType Directory -Force PKVault.WinForm\wwwroot | Out-Null
           Copy-Item -Path frontend\dist\* -Destination PKVault.WinForm\wwwroot -Recurse -Force
+        shell: pwsh
 
       - name: Setup .NET SDK
         uses: actions/setup-dotnet@v3
@@ -51,8 +49,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.nuget/packages
-          key: nuget-packages-${{ runner.os }}-$(Get-FileHash -Path "pkvault.sln" -Algorithm SHA256 | ForEach-Object { $_.Hash })
-        shell: pwsh
+          key: nuget-packages-${{ runner.os }}-${{ hashFiles('**/pkvault.sln') }}
+          restore-keys: |
+            nuget-packages-${{ runner.os }}-
 
       - name: Restore solution
         run: dotnet restore ./pkvault.sln
@@ -66,6 +65,7 @@ jobs:
             -p:PublishSingleFile=true \
             -p:PublishTrimmed=true \
             -o ./artifacts
+
       - name: List artifacts
         run: dir artifacts
         shell: pwsh
@@ -80,11 +80,11 @@ jobs:
       - name: Find built EXE (for release upload)
         if: startsWith(github.ref, 'refs/tags/')
         id: find_exe
-        shell: pwsh
         run: |
           $exe = (Get-ChildItem -Path artifacts -Filter *.exe -Recurse | Select-Object -First 1).FullName
           if (-not $exe) { Write-Error "No EXE found in artifacts"; exit 1 }
           echo "exe=$exe" >> $env:GITHUB_OUTPUT
+        shell: pwsh
 
       - name: Create GitHub release (on tag)
         if: startsWith(github.ref, 'refs/tags/')
