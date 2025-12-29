@@ -102,7 +102,7 @@ jobs:
 
             cd PKVault.Backend
             dotnet run --no-launch-profile --urls "http://localhost:5000"
-          } -ArgumentList @()
+          }
 
           Write-Host "Backend started with Job ID: $($job.Id)"
 
@@ -129,7 +129,6 @@ jobs:
 
           if (-not $ready) {
             Write-Error "Backend failed to start within 100 seconds"
-            Stop-Job $job -Force
             Remove-Job $job -Force
             exit 1
           }
@@ -143,7 +142,6 @@ jobs:
 
           if ($LASTEXITCODE -ne 0) {
             Write-Error "SDK generation failed with exit code $LASTEXITCODE"
-            Stop-Job $job -Force
             Remove-Job $job -Force
             exit 1
           }
@@ -152,11 +150,10 @@ jobs:
           Write-Host "Generated SDK files:"
           Get-ChildItem -Path src/data/sdk -Recurse -File | Select-Object -First 10
 
-          # Stop backend
-          Write-Host "Stopping backend job..."
-          Stop-Job $job -Force
-          Remove-Job $job -Force
-          Start-Sleep -Seconds 3
+          # Stop backend - use Remove-Job instead of Stop-Job
+          Write-Host "Removing backend job..."
+          Remove-Job -Id $job.Id -Force
+          Write-Host "Backend job removed successfully"
 
       - name: Build Frontend
         run: |
